@@ -81,6 +81,15 @@ class Scanner:
         self._universe = selected
         self._universe_loaded_at = time.monotonic()
         log.info("Univers: %d symboles suivis (%s)", len(selected), self.cfg.interval)
+        if self.cfg.open_interest_enabled and len(selected) > 50:
+            log.warning(
+                "Open Interest actif sur %d symboles: %d requetes supplementaires par cycle "
+                "(une par symbole, toutes les %ds). Limitez avec --top ou espacez les cycles "
+                "pour eviter un blocage temporaire de l'IP.",
+                len(selected),
+                len(selected),
+                self.cfg.scan_interval_seconds,
+            )
         return selected
 
     # ---------------------------------------------------------------- Scan
@@ -89,6 +98,8 @@ class Scanner:
         started = time.monotonic()
         result = ScanResult()
         symbols = await self.universe()
+
+        funding = await self._funding_rates()
 
         async def analyse(symbol: str) -> tuple[Signal | None, PairMetrics | None]:
             try:
@@ -99,7 +110,14 @@ class Scanner:
                 return None, None
             result.scanned += 1
             signal = strategy.evaluate(series, self.cfg)
-            return signal, compute_metrics(series, self.cfg, signal)
+            metrics = compute_metrics(
+                series,
+                self.cfg,
+                signal,
+                funding_rate=funding.get(symbol),
+                oi_rows=await self._open_interest(symbol),
+            )
+            return signal, metrics
 
         found = await asyncio.gather(*(analyse(s) for s in symbols))
 
@@ -116,6 +134,28 @@ class Scanner:
         result.ranking = rank_pairs(mesures, self.cfg)
         result.duration = time.monotonic() - started
         return result
+
+    async def _funding_rates(self) -> dict[str, float]:
+        """Funding de tout l'univers. Une panne ici ne doit pas casser le scan."""
+        if not self.cfg.funding_enabled:
+            return {}
+        try:
+            return await self.client.funding_rates()
+        except BinanceError as exc:
+            log.warning("Funding indisponible ce cycle (%s), classement sans cette mesure.", exc)
+            return {}
+
+    async def _open_interest(self, symbol: str) -> list[dict] | None:
+        """Historique d'Open Interest d'un symbole, ou None si indisponible."""
+        if not self.cfg.open_interest_enabled:
+            return None
+        period = self.client.oi_period_for(self.cfg.interval)
+        try:
+            rows = await self.client.open_interest_hist(symbol, period, self.cfg.oi_lookback + 1)
+        except BinanceError as exc:
+            log.debug("%s: Open Interest indisponible (%s)", symbol, exc)
+            return None
+        return rows or None
 
     def _accept(self, signal: Signal) -> bool:
         """Anti-spam: un meme symbole/sens ne realerte pas avant la fin du cooldown."""

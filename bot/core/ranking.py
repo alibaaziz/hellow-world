@@ -30,10 +30,25 @@ class PairMetrics:
     atr_expansion: float  # ATR courant / ATR moyen
     range_position: float  # position dans le range recent, 0 = plus bas, 1 = plus haut
     signal: Signal | None = None
+    funding_rate: float | None = None  # dernier taux de funding (0.0001 = 0.01%)
+    oi_change_pct: float | None = None  # variation d'Open Interest sur la fenetre
 
     @property
     def abs_price_change_pct(self) -> float:
         return abs(self.price_change_pct)
+
+    @property
+    def abs_funding_bps(self) -> float | None:
+        """Funding en points de base absolus. Un funding extreme, positif ou
+        negatif, signale un positionnement desequilibre: le sens importe moins
+        que l'amplitude pour reperer une paire a surveiller."""
+        return abs(self.funding_rate) * 10_000 if self.funding_rate is not None else None
+
+    @property
+    def abs_oi_change_pct(self) -> float | None:
+        """Une chute d'Open Interest (debouclage) est aussi remarquable qu'une
+        hausse (argent frais): on classe sur l'amplitude."""
+        return abs(self.oi_change_pct) if self.oi_change_pct is not None else None
 
 
 @dataclass
@@ -52,14 +67,42 @@ class RankedPair:
     def resume(self) -> str:
         m = self.metrics
         sens = m.signal.side.value if m.signal else "-"
+        oi = f"{m.oi_change_pct:>+6.1f}%" if m.oi_change_pct is not None else "     -"
+        funding = f"{m.funding_rate * 100:>+6.3f}%" if m.funding_rate is not None else "      -"
         return (
-            f"{self.symbol:<14} {self.score:>5.1f}  vol x{m.volume_ratio:>5.2f}  "
-            f"var {m.price_change_pct:>+6.2f}%  ATR x{m.atr_expansion:>4.2f}  "
-            f"pos {m.range_position:>4.2f}  {sens}"
+            f"{self.symbol:<12} {self.score:>5.1f}  x{m.volume_ratio:>5.2f}  "
+            f"{m.price_change_pct:>+6.2f}%  x{m.atr_expansion:>4.2f}  "
+            f"{oi}  {funding}  {sens}"
         )
 
 
-def compute_metrics(series: Series, cfg: Config, signal: Signal | None = None) -> PairMetrics | None:
+def open_interest_change_pct(rows: list[dict], lookback: int) -> float | None:
+    """Variation d'Open Interest en % entre la fenetre et maintenant.
+
+    `rows` est la reponse de /futures/data/openInterestHist, du plus ancien au
+    plus recent. Renvoie None si les donnees sont absentes ou inexploitables.
+    """
+    valeurs: list[float] = []
+    for row in rows:
+        try:
+            valeurs.append(float(row["sumOpenInterest"]))
+        except (KeyError, TypeError, ValueError):
+            continue
+    if len(valeurs) < 2:
+        return None
+    reference = valeurs[max(0, len(valeurs) - 1 - lookback)]
+    if reference <= 0:
+        return None
+    return (valeurs[-1] - reference) / reference * 100
+
+
+def compute_metrics(
+    series: Series,
+    cfg: Config,
+    signal: Signal | None = None,
+    funding_rate: float | None = None,
+    oi_rows: list[dict] | None = None,
+) -> PairMetrics | None:
     """Mesure une paire. Renvoie None si l'historique est insuffisant."""
     fenetre = cfg.ranking_lookback
     if len(series) < max(fenetre + 1, cfg.min_required_candles):
@@ -98,6 +141,10 @@ def compute_metrics(series: Series, cfg: Config, signal: Signal | None = None) -
         atr_expansion=atr_expansion,
         range_position=range_position,
         signal=signal,
+        funding_rate=funding_rate,
+        oi_change_pct=(
+            open_interest_change_pct(oi_rows, cfg.oi_lookback) if oi_rows is not None else None
+        ),
     )
 
 
@@ -126,17 +173,44 @@ def percentile_ranks(values: list[float]) -> list[float]:
     return rangs
 
 
+def percentile_ranks_optional(values: list[float | None]) -> list[float] | None:
+    """Rangs centiles tolerants aux trous.
+
+    Les paires sans donnee recoivent 50 : ne pas savoir ne doit ni avantager ni
+    penaliser une paire. Renvoie None si personne n'a la donnee, pour que la
+    composante soit retiree de la ponderation au lieu de tout aplatir a 50.
+    """
+    presents = [(i, v) for i, v in enumerate(values) if v is not None]
+    if not presents:
+        return None
+    rangs_presents = percentile_ranks([v for _, v in presents])
+    resultat = [50.0] * len(values)
+    for (i, _), rang in zip(presents, rangs_presents):
+        resultat[i] = rang
+    return resultat
+
+
 def rank_pairs(metrics: list[PairMetrics], cfg: Config) -> list[RankedPair]:
     """Classe les paires, la plus interessante en premier."""
     if not metrics:
         return []
 
-    composantes = {
+    composantes: dict[str, list[float]] = {
         "volume": percentile_ranks([m.volume_ratio for m in metrics]),
         "momentum": percentile_ranks([m.abs_price_change_pct for m in metrics]),
         "volatilite": percentile_ranks([m.atr_expansion for m in metrics]),
         "extreme": percentile_ranks([abs(m.range_position - 0.5) for m in metrics]),
     }
+    # Funding et Open Interest peuvent etre desactives ou indisponibles: la
+    # composante n'existe alors tout simplement pas, et les poids se
+    # renormalisent sur celles qui restent.
+    for nom, valeurs in (
+        ("funding", [m.abs_funding_bps for m in metrics]),
+        ("open_interest", [m.abs_oi_change_pct for m in metrics]),
+    ):
+        rangs = percentile_ranks_optional(valeurs)
+        if rangs is not None:
+            composantes[nom] = rangs
     poids = cfg.ranking_weights
 
     classees = []
@@ -159,9 +233,9 @@ def format_table(pairs: list[RankedPair], limite: int = 10) -> str:
     if not pairs:
         return "Aucune paire classee."
     lignes = [
-        f"{'PAIRE':<14} {'SCORE':>5}  {'VOLUME':>9}  {'VARIATION':>11}  "
-        f"{'ATR':>7}  {'POS':>7}  SETUP",
-        "-" * 78,
+        f"{'PAIRE':<12} {'SCORE':>5}  {'VOL':>6}  {'VARIAT':>7}  {'ATR':>5}  "
+        f"{'OI':>7}  {'FUNDING':>7}  SETUP",
+        "-" * 74,
     ]
     lignes += [p.resume() for p in pairs[:limite]]
     return "\n".join(lignes)

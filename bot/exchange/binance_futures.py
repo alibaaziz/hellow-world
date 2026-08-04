@@ -131,6 +131,44 @@ class BinanceFuturesClient:
         rows = await self._request("GET", "/fapi/v1/ticker/24hr")
         return {row["symbol"]: row for row in rows}
 
+    async def funding_rates(self) -> dict[str, float]:
+        """Dernier taux de funding de TOUS les symboles, en une seule requete.
+
+        `/fapi/v1/premiumIndex` sans parametre renvoie l'univers entier: c'est ce
+        qui rend cette mesure quasi gratuite, contrairement a l'Open Interest.
+        """
+        rows = await self._request("GET", "/fapi/v1/premiumIndex")
+        if isinstance(rows, dict):  # la forme change si un symbole est precise
+            rows = [rows]
+        taux: dict[str, float] = {}
+        for row in rows:
+            try:
+                taux[row["symbol"]] = float(row["lastFundingRate"])
+            except (KeyError, TypeError, ValueError):
+                continue
+        return taux
+
+    # Periodes acceptees par /futures/data/openInterestHist.
+    OI_PERIODS = ("5m", "15m", "30m", "1h", "2h", "4h", "6h", "12h", "1d")
+
+    @classmethod
+    def oi_period_for(cls, interval: str) -> str:
+        """Periode d'Open Interest la plus proche de l'unite de temps du scan."""
+        return interval if interval in cls.OI_PERIODS else "15m"
+
+    async def open_interest_hist(self, symbol: str, period: str, limit: int) -> list[dict]:
+        """Historique d'Open Interest d'UN symbole (30 derniers jours seulement).
+
+        Une requete par symbole: c'est le cout de cette mesure, d'ou l'option
+        `OPEN_INTEREST_ENABLED` desactivee par defaut.
+        """
+        rows = await self._request(
+            "GET",
+            "/futures/data/openInterestHist",
+            {"symbol": symbol, "period": period, "limit": max(2, min(limit, 500))},
+        )
+        return rows if isinstance(rows, list) else []
+
     async def klines(self, symbol: str, interval: str, limit: int) -> Series:
         """Bougies FERMEES uniquement: la derniere bougie en cours est ecartee."""
         rows = await self._request(

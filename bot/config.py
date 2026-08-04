@@ -76,13 +76,21 @@ class Config:
 
     # --- Classement des paires ---
     ranking_lookback: int = 20  # bougies servant de reference aux mesures
+    # Funding: une seule requete pour tout l'univers, donc actif par defaut.
+    funding_enabled: bool = True
+    # Open Interest: UNE REQUETE PAR SYMBOLE. Sur 300 paires cela double le
+    # trafic du cycle, d'ou le defaut a false. A activer avec MAX_SYMBOLS.
+    open_interest_enabled: bool = False
+    oi_lookback: int = 8  # periodes d'Open Interest comparees a maintenant
     ranking_weights: dict[str, float] = field(
         default_factory=lambda: {
-            "volume": 0.35,      # anomalie de volume: le signal precoce le plus fiable
-            "momentum": 0.25,    # amplitude du mouvement recent
-            "volatilite": 0.20,  # expansion de l'ATR
-            "extreme": 0.10,     # proximite d'un extreme de range
-            "setup": 0.10,       # une regle technique vient de se declencher
+            "volume": 0.30,         # anomalie de volume: le signal precoce le plus fiable
+            "momentum": 0.20,       # amplitude du mouvement recent
+            "open_interest": 0.15,  # argent frais qui entre (ou qui deboucle)
+            "volatilite": 0.15,     # expansion de l'ATR
+            "funding": 0.10,        # positionnement desequilibre
+            "extreme": 0.05,        # proximite d'un extreme de range
+            "setup": 0.05,          # une regle technique vient de se declencher
         }
     )
 
@@ -132,6 +140,9 @@ class Config:
             rsi_overbought=_env_float("RSI_OVERBOUGHT", cls.rsi_overbought),
             rsi_reversal_enabled=_env_bool("RSI_REVERSAL_ENABLED", cls.rsi_reversal_enabled),
             ranking_lookback=_env_int("RANKING_LOOKBACK", 20),
+            funding_enabled=_env_bool("FUNDING_ENABLED", cls.funding_enabled),
+            open_interest_enabled=_env_bool("OPEN_INTEREST_ENABLED", cls.open_interest_enabled),
+            oi_lookback=_env_int("OI_LOOKBACK", cls.oi_lookback),
             ema_fast=_env_int("EMA_FAST", cls.ema_fast),
             ema_slow=_env_int("EMA_SLOW", cls.ema_slow),
             ema_trend=_env_int("EMA_TREND", cls.ema_trend),

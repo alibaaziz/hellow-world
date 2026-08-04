@@ -86,27 +86,58 @@ python main.py --rank 20            # boucle continue, top 20 a chaque cycle
 ```
 
 ```
-PAIRE          SCORE     VOLUME    VARIATION      ATR      POS  SETUP
-------------------------------------------------------------------------------
-PUMPUSDT        97.5  vol x14.49  var +17.65%  ATR x1.91  pos 0.98  LONG
-CALMEUSDT       44.4  vol x 1.00  var  +2.14%  ATR x1.05  pos 0.99  -
+PAIRE        SCORE     VOL   VARIAT    ATR       OI  FUNDING  SETUP
+--------------------------------------------------------------------------
+PUMPUSDT      98.8  x14.49  +17.65%  x1.91   +72.0%  +0.250%  LONG
+CALMEUSDT     41.9  x 1.00   +2.14%  x1.05    +0.8%  +0.001%  -
+BTCUSDT       28.1  x 1.00   +2.05%  x1.03    +0.8%  +0.001%  -
 ```
 
-Cinq composantes, ponderees par `Config.ranking_weights` :
+Sept composantes, ponderees par `Config.ranking_weights` :
 
 | Composante | Poids | Mesure |
 |---|---|---|
-| `volume` | 0.35 | volume de la derniere bougie / moyenne des 20 precedentes |
-| `momentum` | 0.25 | variation absolue du prix sur la fenetre |
-| `volatilite` | 0.20 | ATR courant / ATR moyen |
-| `extreme` | 0.10 | proximite d'un extreme du range recent |
-| `setup` | 0.10 | une regle technique vient de se declencher |
+| `volume` | 0.30 | volume de la derniere bougie / moyenne des 20 precedentes |
+| `momentum` | 0.20 | variation absolue du prix sur la fenetre |
+| `open_interest` | 0.15 | variation d'Open Interest sur `OI_LOOKBACK` periodes |
+| `volatilite` | 0.15 | ATR courant / ATR moyen |
+| `funding` | 0.10 | taux de funding absolu, en points de base |
+| `extreme` | 0.05 | proximite d'un extreme du range recent |
+| `setup` | 0.05 | une regle technique vient de se declencher |
+
+Open Interest et funding sont classes sur leur **valeur absolue** : un
+debouclage massif de positions est aussi remarquable qu'un afflux d'argent
+frais, et un funding tres negatif signale autant qu'un tres positif.
 
 Chaque composante est convertie en **rang centile sur l'univers scanne**, pas
 comparee a un seuil absolu. C'est ce qui rend le score comparable d'une paire a
 l'autre : un volume a 8 fois sa moyenne ne veut pas dire la meme chose sur
 BTCUSDT que sur un altcoin, alors que « premiere paire de l'univers en anomalie
 de volume » a le meme sens partout.
+
+### Le cout des donnees Futures
+
+Ces deux mesures ne coutent pas du tout la meme chose, d'ou des defauts
+differents. Compte des requetes mesure sur un univers de 5 paires :
+
+| Configuration | Requetes par cycle |
+|---|---|
+| sans funding ni OI | 8 |
+| `FUNDING_ENABLED=true` | 9 |
+| `+ OPEN_INTEREST_ENABLED=true` | 14 |
+
+`/fapi/v1/premiumIndex` renvoie l'univers entier en **une** requete : le funding
+est donc actif par defaut, son cout ne depend pas du nombre de paires.
+`/futures/data/openInterestHist` est en revanche **par symbole** : sur 300
+paires cela ajoute 300 requetes a chaque cycle, avec un vrai risque de blocage
+temporaire de l'IP. Il est desactive par defaut, et le bot previent au demarrage
+si vous l'activez sur plus de 50 paires. A utiliser avec `--top`.
+
+Si une mesure est indisponible (desactivee, panne d'API, symbole sans
+historique), sa composante est **retiree de la ponderation** et les poids se
+renormalisent sur celles qui restent — le score n'est pas dilue. Une paire
+isolee sans donnee recoit le rang median : ne pas savoir ne doit ni l'avantager
+ni la penaliser.
 
 A noter : le classement n'est pas soumis au `COOLDOWN_MINUTES`. Les alertes ne
 se repetent pas, mais le classement doit refleter l'etat du marche a chaque
@@ -260,7 +291,7 @@ pip install pytest
 python -m pytest tests/ -q
 ```
 
-112 tests, sans acces reseau : le RSI est verifie contre une table de reference
+136 tests, sans acces reseau : le RSI est verifie contre une table de reference
 publiee, le scanner tourne sur un faux client, les regles de dimensionnement
 sont testees jusqu'aux cas de refus et le simulateur de trades est verifie sur
 des bougies construites a la main. Un test verifie aussi que le chemin rapide

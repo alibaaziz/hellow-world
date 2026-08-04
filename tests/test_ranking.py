@@ -9,7 +9,9 @@ from bot.core.ranking import (
     PairMetrics,
     compute_metrics,
     format_table,
+    open_interest_change_pct,
     percentile_ranks,
+    percentile_ranks_optional,
     rank_pairs,
 )
 from bot.models import Candle, Series, Side, Signal
@@ -35,7 +37,8 @@ def serie_avec_volumes(closes: list[float], volumes: list[float], symbol="TESTUS
     return Series(symbol=symbol, interval="15m", candles=candles)
 
 
-def metrics(symbol="X", volume_ratio=1.0, change=0.0, atr_exp=1.0, pos=0.5, signal=None):
+def metrics(symbol="X", volume_ratio=1.0, change=0.0, atr_exp=1.0, pos=0.5, signal=None,
+            funding=None, oi=None):
     return PairMetrics(
         symbol=symbol,
         price=100.0,
@@ -44,6 +47,8 @@ def metrics(symbol="X", volume_ratio=1.0, change=0.0, atr_exp=1.0, pos=0.5, sign
         atr_expansion=atr_exp,
         range_position=pos,
         signal=signal,
+        funding_rate=funding,
+        oi_change_pct=oi,
     )
 
 
@@ -208,3 +213,125 @@ def test_format_table_respecte_la_limite():
 
 def test_format_table_sans_paire():
     assert "Aucune paire" in format_table([])
+
+
+# ------------------------------------------------- Open Interest et funding
+
+
+def oi_rows(valeurs: list[float]) -> list[dict]:
+    return [
+        {"symbol": "X", "sumOpenInterest": str(v), "sumOpenInterestValue": str(v * 100),
+         "timestamp": 1_583_127_900_000 + i * 900_000}
+        for i, v in enumerate(valeurs)
+    ]
+
+
+def test_open_interest_change_calcule_la_variation():
+    # 100 -> 130 sur la fenetre demandee
+    assert open_interest_change_pct(oi_rows([100.0, 110.0, 130.0]), lookback=2) == pytest.approx(30.0)
+
+
+def test_open_interest_change_detecte_un_debouclage():
+    assert open_interest_change_pct(oi_rows([200.0, 150.0]), lookback=1) == pytest.approx(-25.0)
+
+
+def test_open_interest_change_limite_la_fenetre_a_l_historique():
+    """Un lookback plus grand que l'historique remonte au plus ancien disponible."""
+    assert open_interest_change_pct(oi_rows([100.0, 200.0]), lookback=99) == pytest.approx(100.0)
+
+
+def test_open_interest_change_donnees_inexploitables():
+    assert open_interest_change_pct([], lookback=8) is None
+    assert open_interest_change_pct(oi_rows([100.0]), lookback=8) is None  # un seul point
+    assert open_interest_change_pct(oi_rows([0.0, 50.0]), lookback=1) is None  # reference nulle
+    assert open_interest_change_pct([{"pas": "le bon champ"}], lookback=8) is None
+
+
+def test_compute_metrics_integre_funding_et_oi():
+    cfg = Config(ranking_lookback=20, oi_lookback=2)
+    series = make_series(ramp(100, 110, 120))
+    m = compute_metrics(series, cfg, funding_rate=0.0005, oi_rows=oi_rows([100.0, 110.0, 125.0]))
+    assert m is not None
+    assert m.funding_rate == 0.0005
+    assert m.abs_funding_bps == pytest.approx(5.0)  # 0.05% = 5 points de base
+    assert m.oi_change_pct == pytest.approx(25.0)
+
+
+def test_metriques_optionnelles_absentes_par_defaut():
+    cfg = Config(ranking_lookback=20)
+    m = compute_metrics(make_series(ramp(100, 110, 120)), cfg)
+    assert m is not None
+    assert m.funding_rate is None and m.oi_change_pct is None
+    assert m.abs_funding_bps is None and m.abs_oi_change_pct is None
+
+
+def test_funding_negatif_compte_comme_extreme():
+    """Un funding tres negatif signale autant qu'un tres positif."""
+    assert metrics(funding=-0.0009).abs_funding_bps == pytest.approx(9.0)
+    assert metrics(funding=0.0009).abs_funding_bps == pytest.approx(9.0)
+
+
+def test_percentile_ranks_optional_neutralise_les_trous():
+    rangs = percentile_ranks_optional([5.0, None, 1.0])
+    assert rangs is not None
+    assert rangs[1] == 50.0  # la paire sans donnee n'est ni avantagee ni penalisee
+    assert rangs[0] == 100.0 and rangs[2] == 0.0
+
+
+def test_percentile_ranks_optional_sans_aucune_donnee():
+    assert percentile_ranks_optional([None, None]) is None
+
+
+def test_composante_absente_est_retiree_de_la_ponderation():
+    """Sans funding ni OI, le score reste sur 100 au lieu d'etre dilue."""
+    cfg = Config()
+    signal = Signal(
+        symbol="FORTE", side=Side.LONG, interval="15m", price=100.0, score=2, reasons=["x"]
+    )
+    lot = [metrics("FORTE", volume_ratio=9.0, change=9.0, atr_exp=3.0, pos=1.0, signal=signal),
+           metrics("FAIBLE", volume_ratio=1.0, change=0.0, atr_exp=1.0, pos=0.5)]
+    classement = rank_pairs(lot, cfg)
+    assert "funding" not in classement[0].components
+    assert "open_interest" not in classement[0].components
+    # Premiere sur toutes les composantes disponibles: le score sature a 100
+    # parce que les poids se renormalisent sur celles qui restent.
+    assert classement[0].score == pytest.approx(100.0)
+
+
+def test_open_interest_fait_monter_une_paire():
+    cfg = Config()
+    forte = metrics("OIFORT", oi=40.0)
+    faible = metrics("OIFAIBLE", oi=0.5)
+    classement = {p.symbol: p.score for p in rank_pairs([forte, faible], cfg)}
+    assert classement["OIFORT"] > classement["OIFAIBLE"]
+
+
+def test_funding_extreme_fait_monter_une_paire():
+    cfg = Config()
+    extreme = metrics("CHAUD", funding=0.0025)
+    neutre = metrics("CALME", funding=0.00001)
+    classement = {p.symbol: p.score for p in rank_pairs([extreme, neutre], cfg)}
+    assert classement["CHAUD"] > classement["CALME"]
+
+
+def test_paire_sans_oi_n_est_pas_penalisee_face_a_une_paire_moyenne():
+    """Une paire sans donnee d'OI doit se retrouver au milieu, pas derniere."""
+    cfg = Config(ranking_weights={"open_interest": 1.0})
+    lot = [metrics("HAUT", oi=50.0), metrics("INCONNU"), metrics("BAS", oi=0.1)]
+    scores = {p.symbol: p.score for p in rank_pairs(lot, cfg)}
+    assert scores["HAUT"] > scores["INCONNU"] > scores["BAS"]
+
+
+def test_format_table_affiche_oi_et_funding():
+    cfg = Config()
+    classement = rank_pairs([metrics("BTCUSDT", oi=12.5, funding=0.0003)], cfg)
+    texte = format_table(classement)
+    assert "OI" in texte and "FUNDING" in texte
+    assert "+12.5%" in texte
+    assert "+0.030%" in texte  # 0.0003 rendu en pourcentage
+
+
+def test_format_table_affiche_un_tiret_sans_donnee():
+    cfg = Config()
+    texte = format_table(rank_pairs([metrics("BTCUSDT")], cfg))
+    assert "BTCUSDT" in texte
