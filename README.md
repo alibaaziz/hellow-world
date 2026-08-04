@@ -115,6 +115,50 @@ main.py                      CLI
 Ajouter une regle : ecrire une fonction `(Snapshot, Config) -> (Side, str) | None`
 dans `core/signals.py` et l'ajouter a `TRIGGER_RULES` ou `CONFIRM_RULES`.
 
+## Backtest
+
+`tools/backtest.py` rejoue un historique bougie par bougie en appelant la **meme**
+fonction `evaluate()` que le scanner en direct, puis simule chaque trade sur les
+bougies suivantes : stop ou objectif touche en premier.
+
+```bash
+python tools/backtest.py donnees.csv --min-score 3
+python tools/backtest.py klines.json --max-bars 50 --fee-pct 0.08
+```
+
+Il accepte un CSV avec des colonnes `Open/High/Low/Close/Volume` ou un export
+JSON brut de `/fapi/v1/klines`. Deux choix volontairement pessimistes :
+
+- si une bougie touche le stop **et** l'objectif, le trade est compte perdant :
+  on ignore l'ordre reel des touches, et surestimer ses gains est la pire erreur
+  d'un backtest ;
+- `--fee-pct` (0.08 % par defaut, soit taker Binance des deux cotes) est converti
+  en multiples de R **trade par trade**, car un stop serre encaisse
+  proportionnellement beaucoup plus de frais qu'un stop large.
+
+C'est cette derniere ligne qui compte : un resultat brut positif peut devenir
+franchement negatif une fois les frais integres. Voir la section suivante.
+
+## Ce que le backtest a montre
+
+La strategie a ete rejouee sur de vraies donnees OHLCV (EURUSD horaire,
+5 000 bougies ; GOOG journalier, 2 148 bougies), avec la config par defaut :
+
+| Jeu de donnees | Signaux | Reussite | Brut | Net (frais 0.08 %) |
+|---|---|---|---|---|
+| EURUSD 1h | 716 | 36.6 % | +0.066 R/trade | **-0.368 R/trade** |
+| GOOG 1j | 296 | 36.5 % | +0.088 R/trade | +0.064 R/trade |
+
+Le taux de reussite depasse a peine le seuil d'equilibre du ratio 1:2 (33.3 %),
+donc l'avantage brut est mince. Sur EURUSD les stops ATR font 0.20 % du prix :
+les frais coutent alors 0.43 R par trade et retournent completement le resultat.
+Sur GOOG les stops font 3.90 %, les frais deviennent negligeables.
+
+**Conclusion pratique** : cette strategie n'est pas exploitable sur des stops
+serres. Elargir le stop (`ATR_STOP_MULTIPLIER`) ou monter en unite de temps
+reduit la part des frais. A verifier sur vos propres donnees Binance avant
+d'envisager le moindre ordre reel.
+
 ## Tests
 
 ```bash
@@ -122,9 +166,10 @@ pip install pytest
 python -m pytest tests/ -q
 ```
 
-67 tests, sans acces reseau : le RSI est verifie contre une table de reference
-publiee, le scanner tourne sur un faux client et les regles de dimensionnement
-sont testees jusqu'aux cas de refus.
+88 tests, sans acces reseau : le RSI est verifie contre une table de reference
+publiee, le scanner tourne sur un faux client, les regles de dimensionnement
+sont testees jusqu'aux cas de refus et le simulateur de trades est verifie sur
+des bougies construites a la main.
 
 ## Avertissement
 
