@@ -22,6 +22,7 @@ python main.py --once                       # un seul passage puis sortie
 python main.py --tf 5m --min-score 3        # unite de temps 5m, filtre serre
 python main.py --symbols BTCUSDT,ETHUSDT    # liste imposee
 python main.py --top 50                     # les 50 symboles les plus liquides
+python main.py --rank 20                    # classement des 20 paires les plus actives
 python main.py -v                           # logs detailles (requetes HTTP)
 ```
 
@@ -30,20 +31,37 @@ necessaire pour scanner.
 
 ## Ce que le bot detecte
 
-Trois regles peuvent **declencher** un signal :
+Trois regles peuvent **declencher** un signal, dont deux actives par defaut :
 
-| Regle | LONG | SHORT |
-|---|---|---|
-| Croisement EMA | EMA9 passe au-dessus de EMA21 | EMA9 passe sous EMA21 |
-| Retournement RSI | RSI sort de la survente (< 30) | RSI sort du surachat (> 70) |
-| Cassure Bollinger | cloture au-dessus de la bande haute | cloture sous la bande basse |
+| Regle | LONG | SHORT | Active |
+|---|---|---|---|
+| Croisement EMA | EMA9 passe au-dessus de EMA21 | EMA9 passe sous EMA21 | oui |
+| Cassure Bollinger | cloture au-dessus de la bande haute | cloture sous la bande basse | oui |
+| Retournement RSI | RSI sort de la survente (< 30) | RSI sort du surachat (> 70) | non |
 
 Une quatrieme regle **confirme** sans jamais declencher seule : la position du
 prix par rapport a l'EMA50 (filtre de tendance).
 
-Le **score** d'un signal est le nombre de regles qui vont dans le meme sens.
-Seuls les scores `>= MIN_SCORE` (2 par defaut) sont alertes, et il faut toujours
-au moins un vrai declencheur. Si LONG et SHORT sont a egalite, le bot s'abstient.
+Le **sens** d'un signal vient uniquement des declencheurs ; en cas d'egalite le
+bot s'abstient. Le filtre de tendance ajuste ensuite le **score** : +1 s'il va
+dans le meme sens, -1 sinon. Il ne vote jamais comme un camp a part entiere,
+sinon il annulerait tout declencheur a contre-tendance. Seuls les scores
+`>= MIN_SCORE` (2 par defaut) sont alertes.
+
+### Pourquoi le retournement RSI est desactive
+
+La regle etait silencieusement morte : elle n'a produit que 7 signaux sur 20 000
+bougies BTC horaires. La cause n'etait pas son seuil — le RSI franchit 30 a la
+hausse 297 fois — mais l'agregation. Un rebond de survente se produit **par
+construction** en tendance baissiere : le declencheur votait LONG, le filtre de
+tendance SHORT, egalite, signal jete. Sur 297 franchissements, 4 seulement
+(1 %) se produisent au-dessus de l'EMA50.
+
+Corrige (le filtre de tendance ne s'applique plus aux setups de retour a la
+moyenne), la regle produit 653 signaux. Mais ces trades **perdent 0.137 R en
+moyenne** quand les trades de tendance en gagnent 0.246 — resultat confirme sur
+un second jeu de donnees. Le code et le reglage sont conserves, le comportement
+par defaut non : `RSI_REVERSAL_ENABLED=true` pour la reactiver.
 
 Points importants :
 
@@ -52,6 +70,47 @@ Points importants :
 - chaque signal porte un stop base sur l'ATR (`ATR_STOP_MULTIPLIER`) et un
   objectif derive de `RISK_REWARD` ;
 - `COOLDOWN_MINUTES` empeche de realerter sur le meme symbole/sens.
+
+## Classement des paires
+
+Le score d'un signal est un entier de 1 a 4, et il vaut 2 dans **93 %** des cas
+(mesure sur 20 000 bougies BTC) : il ne classe donc quasiment rien. Si vingt
+paires declenchent en meme temps, dix-neuf sont a egalite.
+
+`--rank` ajoute un classement **continu** de 0 a 100, calcule en comparant les
+paires entre elles :
+
+```bash
+python main.py --once --rank        # top 10
+python main.py --rank 20            # boucle continue, top 20 a chaque cycle
+```
+
+```
+PAIRE          SCORE     VOLUME    VARIATION      ATR      POS  SETUP
+------------------------------------------------------------------------------
+PUMPUSDT        97.5  vol x14.49  var +17.65%  ATR x1.91  pos 0.98  LONG
+CALMEUSDT       44.4  vol x 1.00  var  +2.14%  ATR x1.05  pos 0.99  -
+```
+
+Cinq composantes, ponderees par `Config.ranking_weights` :
+
+| Composante | Poids | Mesure |
+|---|---|---|
+| `volume` | 0.35 | volume de la derniere bougie / moyenne des 20 precedentes |
+| `momentum` | 0.25 | variation absolue du prix sur la fenetre |
+| `volatilite` | 0.20 | ATR courant / ATR moyen |
+| `extreme` | 0.10 | proximite d'un extreme du range recent |
+| `setup` | 0.10 | une regle technique vient de se declencher |
+
+Chaque composante est convertie en **rang centile sur l'univers scanne**, pas
+comparee a un seuil absolu. C'est ce qui rend le score comparable d'une paire a
+l'autre : un volume a 8 fois sa moyenne ne veut pas dire la meme chose sur
+BTCUSDT que sur un altcoin, alors que « premiere paire de l'univers en anomalie
+de volume » a le meme sens partout.
+
+A noter : le classement n'est pas soumis au `COOLDOWN_MINUTES`. Les alertes ne
+se repetent pas, mais le classement doit refleter l'etat du marche a chaque
+cycle.
 
 ## Alertes
 
@@ -106,6 +165,7 @@ bot/
   exchange/binance_futures.py client async, retry + backoff, endpoints signes
   core/indicators.py         SMA, EMA, RSI, Bollinger, ATR (Python pur)
   core/signals.py            regles de detection -> Signal
+  core/ranking.py            classement continu des paires (rangs centiles)
   core/scanner.py            univers, boucle de scan, cooldown, dispatch
   notify/                    console, Telegram
   execution/                 dimensionnement, routeur papier, routeur reel
@@ -113,7 +173,8 @@ main.py                      CLI
 ```
 
 Ajouter une regle : ecrire une fonction `(Snapshot, Config) -> (Side, str) | None`
-dans `core/signals.py` et l'ajouter a `TRIGGER_RULES` ou `CONFIRM_RULES`.
+dans `core/signals.py`, l'envelopper dans un `Rule(...)` et la retourner depuis
+`active_rules()` — ou l'ajouter a `CONFIRM_RULES` s'il s'agit d'un filtre.
 
 ## Backtest
 
@@ -199,7 +260,7 @@ pip install pytest
 python -m pytest tests/ -q
 ```
 
-92 tests, sans acces reseau : le RSI est verifie contre une table de reference
+112 tests, sans acces reseau : le RSI est verifie contre une table de reference
 publiee, le scanner tourne sur un faux client, les regles de dimensionnement
 sont testees jusqu'aux cas de refus et le simulateur de trades est verifie sur
 des bougies construites a la main. Un test verifie aussi que le chemin rapide

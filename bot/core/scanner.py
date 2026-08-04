@@ -12,6 +12,7 @@ from ..exchange.binance_futures import BinanceError, BinanceFuturesClient
 from ..execution.base import OrderRouter, SymbolFilters
 from ..models import Signal
 from ..notify.base import Notifier
+from .ranking import PairMetrics, RankedPair, compute_metrics, format_table, rank_pairs
 from . import signals as strategy
 
 log = logging.getLogger(__name__)
@@ -20,6 +21,7 @@ log = logging.getLogger(__name__)
 @dataclass
 class ScanResult:
     signals: list[Signal] = field(default_factory=list)
+    ranking: list[RankedPair] = field(default_factory=list)
     scanned: int = 0
     errors: int = 0
     duration: float = 0.0
@@ -38,6 +40,7 @@ class Scanner:
         self.notifiers = notifiers
         self.router = router
         self.filters: dict[str, SymbolFilters] = {}
+        self.rank_display = 0  # nombre de paires du classement a afficher (0 = aucun)
         self._universe: list[str] = []
         self._universe_loaded_at: float = 0.0
         self._last_alert: dict[tuple[str, str, str], float] = {}
@@ -87,22 +90,30 @@ class Scanner:
         result = ScanResult()
         symbols = await self.universe()
 
-        async def analyse(symbol: str) -> Signal | None:
+        async def analyse(symbol: str) -> tuple[Signal | None, PairMetrics | None]:
             try:
                 series = await self.client.klines(symbol, self.cfg.interval, self.cfg.candles)
             except BinanceError as exc:
                 log.warning("%s: bougies indisponibles (%s)", symbol, exc)
                 result.errors += 1
-                return None
+                return None, None
             result.scanned += 1
-            return strategy.evaluate(series, self.cfg)
+            signal = strategy.evaluate(series, self.cfg)
+            return signal, compute_metrics(series, self.cfg, signal)
 
         found = await asyncio.gather(*(analyse(s) for s in symbols))
-        for signal in found:
+
+        mesures: list[PairMetrics] = []
+        for signal, metrics in found:
+            if metrics is not None:
+                mesures.append(metrics)
+            # Le cooldown ne filtre que les alertes: le classement, lui, doit
+            # continuer a refleter l'etat reel du marche a chaque cycle.
             if signal is not None and self._accept(signal):
                 result.signals.append(signal)
 
         result.signals.sort(key=lambda s: s.score, reverse=True)
+        result.ranking = rank_pairs(mesures, self.cfg)
         result.duration = time.monotonic() - started
         return result
 
@@ -146,6 +157,8 @@ class Scanner:
                     len(result.signals),
                     f" - {result.errors} erreur(s)" if result.errors else "",
                 )
+                if self.rank_display:
+                    print(f"\n{format_table(result.ranking, self.rank_display)}\n", flush=True)
                 await self.dispatch(result.signals)
             except BinanceError as exc:
                 log.error("Cycle interrompu: %s", exc)

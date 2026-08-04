@@ -6,6 +6,7 @@ qui vont dans le meme sens; seuls les scores >= `Config.min_score` sortent.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 
 from ..config import Config
@@ -113,9 +114,43 @@ def _rule_trend_filter(snap: Snapshot, cfg: Config) -> tuple[Side, str] | None:
     return None
 
 
+@dataclass(frozen=True)
+class Rule:
+    """Un declencheur, son poids et son rapport au filtre de tendance."""
+
+    func: Callable[[Snapshot, Config], tuple[Side, str] | None]
+    poids: int = 1
+    suit_la_tendance: bool = True
+
+    def __call__(self, snap: Snapshot, cfg: Config) -> tuple[Side, str] | None:
+        return self.func(snap, cfg)
+
+
 # Le filtre de tendance ne suffit jamais seul: il confirme, il ne declenche pas.
-TRIGGER_RULES = (_rule_ema_cross, _rule_rsi_reversal, _rule_bollinger_breakout)
+#
+# Le retournement RSI est marque `suit_la_tendance=False` et pese 2. Mesure faite
+# sur 20 000 bougies BTC horaires: le RSI ne franchit 30 a la hausse qu'en
+# tendance baissiere (4 cas sur 297, soit 1%). Un filtre de tendance applique a
+# ce declencheur le condamne donc a ne jamais rien produire. C'est un setup de
+# retour a la moyenne, complet en lui-meme: il se passe de confirmation et n'est
+# pas penalise par une tendance contraire, qui est sa raison d'etre.
+TREND_RULES = (Rule(_rule_ema_cross), Rule(_rule_bollinger_breakout))
+RSI_RULE = Rule(_rule_rsi_reversal, poids=2, suit_la_tendance=False)
 CONFIRM_RULES = (_rule_trend_filter,)
+
+
+def active_rules(cfg: Config) -> tuple[Rule, ...]:
+    """Declencheurs actifs pour cette configuration.
+
+    Le retournement RSI est desactive par defaut. Une fois reparee, la regle
+    produit bien des signaux (653 sur 20 000 bougies BTC horaires au lieu de 7),
+    mais ces trades perdent 0.137 R en moyenne quand les trades de tendance en
+    gagnent 0.246 -- resultat confirme sur un second jeu de donnees. On garde
+    donc le code et le reglage, pas le comportement par defaut.
+    """
+    if cfg.rsi_reversal_enabled:
+        return (TREND_RULES[0], RSI_RULE, TREND_RULES[1])
+    return TREND_RULES
 
 
 def evaluate(series: Series, cfg: Config) -> Signal | None:
@@ -132,35 +167,42 @@ def decide(snap: Snapshot, symbol: str, interval: str, cfg: Config) -> Signal | 
     Separe de `evaluate` pour que le backtest puisse precalculer les indicateurs
     une seule fois tout en passant par exactement la meme logique de decision.
     """
-    triggers: dict[Side, list[str]] = {Side.LONG: [], Side.SHORT: []}
-    confirms: dict[Side, list[str]] = {Side.LONG: [], Side.SHORT: []}
+    declenches: dict[Side, list[tuple[Rule, str]]] = {Side.LONG: [], Side.SHORT: []}
 
-    for rule in TRIGGER_RULES:
+    for rule in active_rules(cfg):
         result = rule(snap, cfg)
         if result is not None:
             side, reason = result
-            triggers[side].append(reason)
-    if not (triggers[Side.LONG] or triggers[Side.SHORT]):
+            declenches[side].append((rule, reason))
+
+    poids = {s: sum(r.poids for r, _ in declenches[s]) for s in Side}
+    if poids[Side.LONG] == poids[Side.SHORT]:
+        # Aucun declencheur, ou declencheurs opposes d'egale force: on s'abstient.
         return None
+    side = Side.LONG if poids[Side.LONG] > poids[Side.SHORT] else Side.SHORT
 
-    for rule in CONFIRM_RULES:
-        result = rule(snap, cfg)
-        if result is not None:
-            side, reason = result
-            confirms[side].append(reason)
+    reasons = [reason for _, reason in declenches[side]]
+    score = poids[side]
 
-    scores = {s: len(triggers[s]) + len(confirms[s]) for s in Side}
-    if scores[Side.LONG] == scores[Side.SHORT]:
-        return None  # signaux contradictoires: on s'abstient
+    # Le sens vient uniquement des declencheurs. Le filtre de tendance ajuste
+    # ensuite le score (+1 s'il va dans le meme sens, -1 sinon) sans jamais voter
+    # comme un camp a part entiere -- sinon il annulerait purement et simplement
+    # tout declencheur a contre-tendance. Il ne s'applique pas aux setups de
+    # retour a la moyenne, qui se declenchent precisement contre la tendance.
+    if any(rule.suit_la_tendance for rule, _ in declenches[side]):
+        for confirm in CONFIRM_RULES:
+            result = confirm(snap, cfg)
+            if result is None:
+                continue
+            confirm_side, reason = result
+            if confirm_side is side:
+                score += 1
+                reasons.append(reason)
+            else:
+                score -= 1
 
-    side = max(scores, key=lambda s: scores[s])
-    # Une confirmation de tendance seule n'est pas un declencheur valable.
-    if not triggers[side]:
-        return None
-    score = scores[side]
     if score < cfg.min_score:
         return None
-    reasons = triggers[side] + confirms[side]
 
     stop, target = _levels(snap, side, cfg)
     return Signal(

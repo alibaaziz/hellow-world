@@ -157,7 +157,7 @@ def test_declencheurs_et_confirmations_ne_se_confondent_pas():
     cfg = Config(min_score=1)
     # Tendance haussiere etablie, aucun declencheur actif sur la derniere bougie.
     snap = snapshot(close=110.0, ema_trend=100.0)
-    assert all(rule(snap, cfg) is None for rule in strategy.TRIGGER_RULES)
+    assert all(rule(snap, cfg) is None for rule in strategy.active_rules(cfg))
     assert strategy._rule_trend_filter(snap, cfg)[0] is Side.LONG
     # Meme avec le seuil le plus permissif, une hausse reguliere n'alerte jamais:
     # le filtre de tendance voterait LONG en continu, mais il ne declenche pas.

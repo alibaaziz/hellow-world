@@ -15,6 +15,7 @@ import logging
 import sys
 
 from bot.config import Config, load_dotenv
+from bot.core.ranking import format_table
 from bot.core.scanner import Scanner
 from bot.exchange.binance_futures import BinanceError, BinanceFuturesClient
 from bot.execution.base import OrderRouter
@@ -33,6 +34,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--symbols", help="liste de symboles separes par des virgules")
     parser.add_argument("--min-score", type=int, help="score minimal d'un signal")
     parser.add_argument("--top", type=int, help="limiter aux N symboles les plus liquides")
+    parser.add_argument(
+        "--rank",
+        nargs="?",
+        type=int,
+        const=10,
+        help="afficher le classement des N paires les plus interessantes (defaut 10)",
+    )
     parser.add_argument("--every", type=int, help="secondes entre deux cycles")
     parser.add_argument("--no-telegram", action="store_true", help="desactiver Telegram")
     parser.add_argument("--verbose", "-v", action="store_true", help="logs de debug")
@@ -100,6 +108,7 @@ async def run(args: argparse.Namespace) -> int:
             log.error("Binance Futures injoignable: %s", exc)
             return 1
 
+        scanner.rank_display = args.rank or 0
         scanner.router = await build_router(cfg, scanner)
         try:
             if args.once:
@@ -110,6 +119,8 @@ async def run(args: argparse.Namespace) -> int:
                     result.duration,
                     len(result.signals),
                 )
+                if args.rank:
+                    print(f"\n{format_table(result.ranking, args.rank)}\n")
                 await scanner.dispatch(result.signals)
                 if not result.signals:
                     print("Aucun signal sur ce cycle.")

@@ -66,12 +66,25 @@ class Config:
     rsi_period: int = 14
     rsi_oversold: float = 30.0
     rsi_overbought: float = 70.0
+    rsi_reversal_enabled: bool = False  # mesure a edge negatif, voir signals.active_rules
     ema_fast: int = 9
     ema_slow: int = 21
     ema_trend: int = 50
     bb_period: int = 20
     bb_std: float = 2.0
     atr_period: int = 14
+
+    # --- Classement des paires ---
+    ranking_lookback: int = 20  # bougies servant de reference aux mesures
+    ranking_weights: dict[str, float] = field(
+        default_factory=lambda: {
+            "volume": 0.35,      # anomalie de volume: le signal precoce le plus fiable
+            "momentum": 0.25,    # amplitude du mouvement recent
+            "volatilite": 0.20,  # expansion de l'ATR
+            "extreme": 0.10,     # proximite d'un extreme de range
+            "setup": 0.10,       # une regle technique vient de se declencher
+        }
+    )
 
     # --- Filtrage des signaux ---
     min_score: int = 2
@@ -117,6 +130,8 @@ class Config:
             rsi_period=_env_int("RSI_PERIOD", cls.rsi_period),
             rsi_oversold=_env_float("RSI_OVERSOLD", cls.rsi_oversold),
             rsi_overbought=_env_float("RSI_OVERBOUGHT", cls.rsi_overbought),
+            rsi_reversal_enabled=_env_bool("RSI_REVERSAL_ENABLED", cls.rsi_reversal_enabled),
+            ranking_lookback=_env_int("RANKING_LOOKBACK", 20),
             ema_fast=_env_int("EMA_FAST", cls.ema_fast),
             ema_slow=_env_int("EMA_SLOW", cls.ema_slow),
             ema_trend=_env_int("EMA_TREND", cls.ema_trend),
