@@ -25,6 +25,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from bot.config import Config  # noqa: E402
+from bot.core import indicators as ta  # noqa: E402
 from bot.core import signals as strategy  # noqa: E402
 from bot.models import Candle, Series, Side, Signal  # noqa: E402
 
@@ -113,22 +114,47 @@ class Stats:
 # ------------------------------------------------------------------ Chargement
 
 
-def load_csv(path: Path, symbol: str, interval: str) -> Series:
-    """Lit un CSV OHLCV. Les noms de colonnes sont reconnus sans tenir compte de la casse."""
+def find_header(rows: list[list[str]], limite: int = 5) -> int:
+    """Indice de la ligne d'en-tete, en sautant un eventuel preambule.
+
+    Beaucoup d'exports reels (CryptoDataDownload par exemple) commencent par une
+    ligne de commentaire avant l'en-tete.
+    """
+    for i, row in enumerate(rows[:limite]):
+        cellules = [c.strip().lower() for c in row]
+        if all(name in cellules for name in REQUIRED):
+            return i
+    entete = [c.strip().lower() for c in rows[0]] if rows else []
+    manquantes = [c for c in REQUIRED if c not in entete]
+    raise ValueError(f"colonnes manquantes {manquantes} (premiere ligne: {entete})")
+
+
+def load_csv(path: Path, symbol: str, interval: str, reverse: bool = False) -> Series:
+    """Lit un CSV OHLCV. Les noms de colonnes sont reconnus sans tenir compte de la casse.
+
+    `reverse=True` pour les fichiers ordonnes du plus recent au plus ancien: la
+    strategie a besoin d'un historique chronologique croissant.
+    """
     with path.open(newline="", encoding="utf-8") as handle:
         rows = list(csv.reader(handle))
     if not rows:
         raise ValueError(f"{path}: fichier vide")
 
-    header = [c.strip().lower() for c in rows[0]]
-    missing = [c for c in REQUIRED if c not in header]
-    if missing:
-        raise ValueError(f"{path}: colonnes manquantes {missing} (trouvees: {header})")
+    try:
+        header_at = find_header(rows)
+    except ValueError as exc:
+        raise ValueError(f"{path}: {exc}") from exc
+
+    header = [c.strip().lower() for c in rows[header_at]]
     idx = {name: header.index(name) for name in REQUIRED}
     vol_idx = header.index("volume") if "volume" in header else None
 
+    data_rows = rows[header_at + 1 :]
+    if reverse:
+        data_rows = list(reversed(data_rows))
+
     candles = []
-    for line_no, row in enumerate(rows[1:], start=2):
+    for line_no, row in enumerate(data_rows, start=2):
         if not any(cell.strip() for cell in row):
             continue
         try:
@@ -160,10 +186,10 @@ def load_binance_json(path: Path, symbol: str, interval: str) -> Series:
     return Series(symbol=symbol, interval=interval, candles=[Candle.from_binance(r) for r in rows])
 
 
-def load(path: Path, symbol: str, interval: str) -> Series:
+def load(path: Path, symbol: str, interval: str, reverse: bool = False) -> Series:
     if path.suffix.lower() == ".json":
         return load_binance_json(path, symbol, interval)
-    return load_csv(path, symbol, interval)
+    return load_csv(path, symbol, interval, reverse=reverse)
 
 
 # ------------------------------------------------------------------ Simulation
@@ -202,6 +228,43 @@ def simulate_trade(
     return Trade(signal, entry_index, dernier, sortie, "expire", gain / risque)
 
 
+def iter_snapshots(series: Series, cfg: Config):
+    """Produit (index, Snapshot) pour chaque bougie exploitable, en un seul passage.
+
+    Tous les indicateurs sont causaux — la valeur a l'indice i ne depend que des
+    bougies jusqu'a i — donc les calculer une fois sur la serie entiere donne
+    exactement les memes nombres que de les recalculer sur chaque fenetre, mais
+    en O(n) au lieu de O(n^2).
+    """
+    closes = series.closes
+    rsi = ta.rsi(closes, cfg.rsi_period)
+    ema_fast = ta.ema(closes, cfg.ema_fast)
+    ema_slow = ta.ema(closes, cfg.ema_slow)
+    ema_trend = ta.ema(closes, cfg.ema_trend)
+    upper, mid, lower = ta.bollinger(closes, cfg.bb_period, cfg.bb_std)
+    atr = ta.atr(series.highs, series.lows, closes, cfg.atr_period)
+
+    for i in range(cfg.min_required_candles - 1, len(series)):
+        requis = (rsi[i], rsi[i - 1], ema_trend[i], upper[i], mid[i], lower[i],
+                  upper[i - 1], lower[i - 1], atr[i])
+        if any(v is None for v in requis):
+            continue
+        yield i, strategy.Snapshot(
+            close=closes[i],
+            rsi=rsi[i],
+            prev_rsi=rsi[i - 1],
+            ema_fast=[ema_fast[i - 1], ema_fast[i]],
+            ema_slow=[ema_slow[i - 1], ema_slow[i]],
+            ema_trend=ema_trend[i],
+            bb_upper=upper[i],
+            bb_mid=mid[i],
+            bb_lower=lower[i],
+            prev_bb_width=upper[i - 1] - lower[i - 1],
+            bb_width=upper[i] - lower[i],
+            atr=atr[i],
+        )
+
+
 def run(
     series: Series,
     cfg: Config,
@@ -214,10 +277,8 @@ def run(
     evaluated = 0
     prochaine_entree_possible = 0
 
-    for end in range(cfg.min_required_candles, len(series) + 1):
-        index = end - 1  # derniere bougie fermee de la fenetre
-        window = Series(series.symbol, series.interval, series.candles[:end])
-        signal = strategy.evaluate(window, cfg)
+    for index, snap in iter_snapshots(series, cfg):
+        signal = strategy.decide(snap, series.symbol, series.interval, cfg)
         evaluated += 1
         if signal is None or index < prochaine_entree_possible:
             continue
@@ -282,6 +343,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--cooldown-bars", type=int, default=0, help="bougies d'attente entre deux entrees"
     )
     parser.add_argument(
+        "--reverse",
+        action="store_true",
+        help="fichier ordonne du plus recent au plus ancien",
+    )
+    parser.add_argument(
         "--fee-pct",
         type=float,
         default=0.08,
@@ -294,7 +360,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     cfg = Config(min_score=args.min_score)
     try:
-        series = load(args.fichier, args.symbol, args.interval)
+        series = load(args.fichier, args.symbol, args.interval, reverse=args.reverse)
     except (OSError, ValueError, json.JSONDecodeError) as exc:
         print(f"Chargement impossible: {exc}", file=sys.stderr)
         return 1

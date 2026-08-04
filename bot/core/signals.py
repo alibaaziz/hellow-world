@@ -123,7 +123,15 @@ def evaluate(series: Series, cfg: Config) -> Signal | None:
     snap = build_snapshot(series, cfg)
     if snap is None:
         return None
+    return decide(snap, series.symbol, series.interval, cfg)
 
+
+def decide(snap: Snapshot, symbol: str, interval: str, cfg: Config) -> Signal | None:
+    """Applique les regles a un snapshot deja calcule.
+
+    Separe de `evaluate` pour que le backtest puisse precalculer les indicateurs
+    une seule fois tout en passant par exactement la meme logique de decision.
+    """
     triggers: dict[Side, list[str]] = {Side.LONG: [], Side.SHORT: []}
     confirms: dict[Side, list[str]] = {Side.LONG: [], Side.SHORT: []}
 
@@ -156,9 +164,9 @@ def evaluate(series: Series, cfg: Config) -> Signal | None:
 
     stop, target = _levels(snap, side, cfg)
     return Signal(
-        symbol=series.symbol,
+        symbol=symbol,
         side=side,
-        interval=series.interval,
+        interval=interval,
         price=snap.close,
         score=score,
         reasons=reasons,

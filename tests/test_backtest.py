@@ -7,10 +7,13 @@ import json
 import pytest
 
 from bot.config import Config
+from bot.core import signals as strategy
 from bot.models import Candle, Series, Side, Signal
 from tools.backtest import (
     Stats,
     Trade,
+    find_header,
+    iter_snapshots,
     load,
     load_binance_json,
     load_csv,
@@ -240,6 +243,70 @@ def test_run_produit_des_trades_sur_un_retournement():
     assert all(t.outcome in {"objectif", "stop", "expire"} for t in stats.trades)
     texte = report("retournement", stats, cfg)
     assert "Signaux:" in texte and "Net    :" in texte
+
+
+def test_chemin_rapide_identique_au_recalcul_complet():
+    """iter_snapshots precalcule les indicateurs une fois: les nombres doivent
+    etre rigoureusement identiques a un recalcul sur chaque fenetre grandissante.
+
+    C'est ce qui autorise le backtest a etre 900x plus rapide sans changer un
+    seul resultat: tous les indicateurs sont causaux.
+    """
+    cfg = Config(min_score=1)
+    series = make_series(ramp(200, 120, 100) + ramp(120, 175, 40) + ramp(175, 130, 40))
+
+    lent = []
+    for end in range(cfg.min_required_candles, len(series) + 1):
+        fenetre = Series(series.symbol, series.interval, series.candles[:end])
+        signal = strategy.evaluate(fenetre, cfg)
+        if signal is not None:
+            lent.append((end - 1, signal.side, signal.score, signal.price, signal.stop_loss))
+
+    rapide = []
+    for index, snap in iter_snapshots(series, cfg):
+        signal = strategy.decide(snap, series.symbol, series.interval, cfg)
+        if signal is not None:
+            rapide.append((index, signal.side, signal.score, signal.price, signal.stop_loss))
+
+    assert lent, "le scenario doit produire des signaux, sinon le test ne prouve rien"
+    assert rapide == lent
+
+
+def test_decide_reprend_le_symbole_et_l_intervalle():
+    cfg = Config(min_score=1)
+    series = make_series(ramp(200, 120, 100) + ramp(120, 175, 40), symbol="ETHUSDT")
+    for _index, snap in iter_snapshots(series, cfg):
+        signal = strategy.decide(snap, "ETHUSDT", "4h", cfg)
+        if signal is not None:
+            assert signal.symbol == "ETHUSDT"
+            assert signal.interval == "4h"
+            return
+    pytest.fail("aucun signal produit sur ce scenario")
+
+
+def test_find_header_saute_un_preambule():
+    rows = [
+        ["Timestamps are UTC", "https://exemple.invalid"],
+        ["date", "symbol", "open", "high", "low", "close", "volume"],
+        ["2024-01-01", "BTCUSD", "1", "2", "0.5", "1.5", "10"],
+    ]
+    assert find_header(rows) == 1
+
+
+def test_load_csv_avec_preambule_et_inversion(tmp_path):
+    """Format CryptoDataDownload: ligne de commentaire, puis ordre antichronologique."""
+    fichier = tmp_path / "data.csv"
+    fichier.write_text(
+        "Timestamps are UTC,https://exemple.invalid\n"
+        "date,open,high,low,close,volume\n"
+        "2024-01-02,10,11,9,10.5,100\n"
+        "2024-01-01,5,6,4,5.5,50\n"
+    )
+    normal = load_csv(fichier, "X", "1h")
+    assert [c.close for c in normal.candles] == [10.5, 5.5]
+
+    inverse = load_csv(fichier, "X", "1h", reverse=True)
+    assert [c.close for c in inverse.candles] == [5.5, 10.5]
 
 
 def test_cooldown_bars_espace_les_entrees():

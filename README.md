@@ -124,6 +124,7 @@ bougies suivantes : stop ou objectif touche en premier.
 ```bash
 python tools/backtest.py donnees.csv --min-score 3
 python tools/backtest.py klines.json --max-bars 50 --fee-pct 0.08
+python tools/backtest.py export.csv --reverse   # fichier du plus recent au plus ancien
 ```
 
 Il accepte un CSV avec des colonnes `Open/High/Low/Close/Volume` ou un export
@@ -141,23 +142,55 @@ franchement negatif une fois les frais integres. Voir la section suivante.
 
 ## Ce que le backtest a montre
 
-La strategie a ete rejouee sur de vraies donnees OHLCV (EURUSD horaire,
-5 000 bougies ; GOOG journalier, 2 148 bougies), avec la config par defaut :
+La strategie a ete rejouee sur de vraies bougies horaires de Bitcoin
+(20 111 bougies Coinbase et 17 583 bougies Bitfinex, 2017-2019), config par
+defaut, frais 0.08 % aller-retour :
 
-| Jeu de donnees | Signaux | Reussite | Brut | Net (frais 0.08 %) |
+| Jeu de donnees | Signaux | Reussite | Brut | Net |
 |---|---|---|---|---|
+| BTC 1h (Coinbase) | 2 767 | 40.5 % | +0.183 R/trade | +0.108 R/trade |
+| BTC 1h (Bitfinex) | 2 410 | 40.9 % | +0.196 R/trade | +0.120 R/trade |
 | EURUSD 1h | 716 | 36.6 % | +0.066 R/trade | **-0.368 R/trade** |
-| GOOG 1j | 296 | 36.5 % | +0.088 R/trade | +0.064 R/trade |
 
-Le taux de reussite depasse a peine le seuil d'equilibre du ratio 1:2 (33.3 %),
-donc l'avantage brut est mince. Sur EURUSD les stops ATR font 0.20 % du prix :
-les frais coutent alors 0.43 R par trade et retournent completement le resultat.
-Sur GOOG les stops font 3.90 %, les frais deviennent negligeables.
+Le seuil d'equilibre d'un ratio 1:2 est 33.3 %. Ce qui separe le crypto du
+forex ici n'est pas la qualite des signaux mais **la largeur du stop** : l'ATR
+de BTC donne des stops a 1.64 % du prix, ceux d'EURUSD a 0.20 %. A frais egaux,
+les seconds encaissent 0.43 R par trade contre 0.075 R pour les premiers.
 
-**Conclusion pratique** : cette strategie n'est pas exploitable sur des stops
-serres. Elargir le stop (`ATR_STOP_MULTIPLIER`) ou monter en unite de temps
-reduit la part des frais. A verifier sur vos propres donnees Binance avant
-d'envisager le moindre ordre reel.
+Balayage de parametres sur BTC 1h, meme jeu de 20 111 bougies :
+
+| Score min | ATR x | Ratio | Signaux | Reussite | Stop moyen | Net R/trade |
+|---|---|---|---|---|---|---|
+| 2 | 1.5 | 1:2 | 2 767 | 40.5 % | 1.64 % | +0.108 |
+| 2 | 1.5 | 1:3 | 2 767 | 35.5 % | 1.64 % | +0.211 |
+| 2 | 3.0 | 1:2 | 2 767 | 46.6 % | 3.28 % | +0.174 |
+| **2** | **3.0** | **1:3** | **2 767** | **44.7 %** | **3.28 %** | **+0.248** |
+| 2 | 5.0 | 1:2 | 2 767 | 48.2 % | 5.46 % | +0.140 |
+| 2 | 5.0 | 1:3 | 2 767 | 47.7 % | 5.46 % | +0.182 |
+| 3 | 3.0 | 1:3 | 201 | 39.3 % | 3.12 % | +0.060 |
+
+Trois enseignements :
+
+- **la surface est large, pas un pic** : les six configs testees a `MIN_SCORE=2`
+  sont toutes positives, ce qui rend le resultat moins suspect qu'un optimum
+  isole ;
+- **monter `MIN_SCORE` a 3 degrade tout** (+0.060 contre +0.248) en divisant le
+  nombre de trades par 14 : exiger trois regles concordantes elimine surtout des
+  bons signaux ;
+- le funding d'un perpetuel est negligeable a cette echelle : la detention
+  moyenne est de 27 h, soit environ 0.034 % de funding, c'est-a-dire 0.010 R.
+  Le net de la meilleure config passe de +0.248 a +0.238 R.
+
+**Ces chiffres ne sont pas ceux de Binance Futures.** Il s'agit de BTC-USD au
+comptant sur Coinbase et Bitfinex, sur une seule periode (2017-2019, bulle puis
+marche baissier). Le slippage n'est pas modelise au-dela des frais, alors qu'un
+`STOP_MARKET` crypto glisse reellement. Rejouez vos propres donnees avant toute
+conclusion :
+
+```bash
+curl -s "https://fapi.binance.com/fapi/v1/klines?symbol=BTCUSDT&interval=1h&limit=1500" > btc.json
+python tools/backtest.py btc.json --symbol BTCUSDT --interval 1h
+```
 
 ## Tests
 
@@ -166,10 +199,12 @@ pip install pytest
 python -m pytest tests/ -q
 ```
 
-88 tests, sans acces reseau : le RSI est verifie contre une table de reference
+92 tests, sans acces reseau : le RSI est verifie contre une table de reference
 publiee, le scanner tourne sur un faux client, les regles de dimensionnement
 sont testees jusqu'aux cas de refus et le simulateur de trades est verifie sur
-des bougies construites a la main.
+des bougies construites a la main. Un test verifie aussi que le chemin rapide
+du backtest (indicateurs precalcules une fois) donne des resultats rigoureusement
+identiques au recalcul sur chaque fenetre.
 
 ## Avertissement
 
