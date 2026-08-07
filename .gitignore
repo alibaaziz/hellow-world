@@ -1,0 +1,8 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Données de marché téléchargées et rapports générés
+data/*.csv
+reports/
