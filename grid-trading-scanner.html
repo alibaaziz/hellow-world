@@ -1,0 +1,451 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Grid Bot - Scanner Autonome</title>
+    <style>
+        body {
+            background-color: #14171c; color: #d8dee6;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            margin: 20px; font-size: 13px;
+        }
+        .container {
+            background-color: #181c22; padding: 20px;
+            border-radius: 8px; border: 1px solid #262c36;
+        }
+        h2 { color: #e5eaf1; margin-top: 0; font-size: 18px; }
+        .controls {
+            display: flex; gap: 15px; align-items: center;
+            background-color: #1f242d; padding: 15px;
+            border-radius: 6px; border: 1px solid #313947; flex-wrap: wrap;
+        }
+        label { display: flex; align-items: center; gap: 8px; font-weight: 500; }
+        input[type="number"], select {
+            background-color: #14171c; border: 1px solid #313947;
+            padding: 6px; border-radius: 4px; color: #d8dee6; outline: none;
+        }
+        button {
+            background-color: #2563eb; color: white; border: none;
+            padding: 8px 16px; border-radius: 4px; cursor: pointer; font-weight: bold;
+        }
+        button:hover { background-color: #3b82f6; }
+        button:disabled { background-color: #374151; color: #6b7280; cursor: not-allowed; }
+
+        table { width: 100%; border-collapse: collapse; margin-top: 20px; }
+        th, td { padding: 10px; text-align: right; border-bottom: 1px solid #262c36; }
+        th:first-child, td:first-child { text-align: left; font-weight: bold; color: #e5eaf1; }
+        th { background-color: #1f242d; color: #9fb0c3; border-right: 1px solid #262c36; }
+        tr:nth-child(even) { background-color: #1d222a; }
+        tr:hover { background-color: #2c3a4f; }
+
+        .green { color: #22c55e; font-weight: bold; }
+        .yellow { color: #eab308; font-weight: bold; }
+        .red { color: #ef4444; font-weight: bold; }
+        #status { color: #8494a8; margin-top: 15px; font-weight: bold;}
+
+        .alert { background-color: #3b2818; border: 1px solid #eab308; padding: 10px; border-radius: 4px; margin-bottom: 15px; color: #eab308;}
+
+        /* Rend le tableau scrollable sur mobile */
+        .table-responsive { overflow-x: auto; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h2>Scanner Grid Trading (100% Client-Side)</h2>
+        <div class="alert">
+            <strong>Système Multi-Proxys actif :</strong> Ce scanner contourne le blocage CORS en utilisant plusieurs proxys en rotation. L'analyse de TOUTES les paires prendra quelques minutes pour éviter le blocage par Binance. Laissez la page ouverte.
+        </div>
+
+        <div class="controls">
+            <label>Volume min 24h (M$): <input type="number" id="minVol" value="20" step="5" style="width: 80px;"></label>
+            <button id="scanBtn" onclick="startScan()">Analyser TOUTES les paires</button>
+        </div>
+
+        <div id="status">Prêt. Cliquez sur le bouton pour lancer le scan complet.</div>
+
+        <div class="table-responsive">
+            <table id="results">
+                <thead>
+                    <tr>
+                        <th>Symbole</th><th>Score</th><th>Prix</th><th>ADX 1h</th><th>ER 1h</th>
+                        <th>Chop 1h</th><th>ATR% 1h</th><th>Vol (M$)</th><th>Grille Min</th>
+                        <th>Grille Max</th><th>Niveaux</th>
+                    </tr>
+                </thead>
+                <tbody></tbody>
+            </table>
+        </div>
+    </div>
+
+    <script>
+        // --- CONFIGURATION ---
+        // Rotation de proxys pour éviter les erreurs 522 ou les blocages.
+        // NB: corsproxy.io exige désormais le paramètre "url=" explicite,
+        // sinon il répond 403 (c'est ce qui faisait échouer tous les scans).
+        const PROXIES = [
+            "https://api.codetabs.com/v1/proxy?quest=",
+            "https://api.allorigins.win/raw?url=",
+            "https://corsproxy.io/?url="
+        ];
+
+        const BASE_URL = "https://fapi.binance.com";
+        const CFG = {
+            indicator_period: 14,
+            analysis_hours: 168,
+            min_klines: 100,
+            maker_fee_pct: 0.02,
+            grid_min_width_atr: 4.0,
+            grid_step_atr: 0.4,
+            grid_min_levels: 8,
+            grid_max_levels: 200,
+            grid_min_step_fee_mult: 3.0,
+            weights: { adx: 2.5, efficiency: 2.0, choppiness: 1.5, regression: 1.5, volatility: 2.0, funding: 0.75, volume: 0.75 }
+        };
+
+        // --- MATH & INDICATEURS ---
+        function wilderSmooth(values, period) {
+            let out = new Array(values.length).fill(NaN);
+            if (values.length < period + 1) return out;
+            let sum = 0;
+            for(let i=1; i<=period; i++) sum += values[i];
+            out[period] = sum / period;
+            let alpha = 1.0 / period;
+            for(let i=period+1; i<values.length; i++) {
+                out[i] = out[i-1] + alpha * (values[i] - out[i-1]);
+            }
+            return out;
+        }
+
+        function calcTrueRange(high, low, close) {
+            let tr = new Array(close.length).fill(0);
+            for(let i=1; i<close.length; i++) {
+                let hl = high[i] - low[i];
+                let hpc = Math.abs(high[i] - close[i-1]);
+                let lpc = Math.abs(low[i] - close[i-1]);
+                tr[i] = Math.max(hl, hpc, lpc);
+            }
+            return tr;
+        }
+
+        function atrPct(high, low, close, period) {
+            if (close.length < period + 2) return NaN;
+            let tr = calcTrueRange(high, low, close);
+            let atr = wilderSmooth(tr, period);
+            let lastAtr = atr[atr.length - 1];
+            let lastClose = close[close.length - 1];
+            return (lastAtr / lastClose) * 100.0;
+        }
+
+        function adx(high, low, close, period) {
+            if (close.length < 2 * period + 2) return NaN;
+            let up = new Array(close.length).fill(0);
+            let down = new Array(close.length).fill(0);
+            let plus_dm = new Array(close.length).fill(0);
+            let minus_dm = new Array(close.length).fill(0);
+
+            for(let i=1; i<close.length; i++) {
+                up[i] = high[i] - high[i-1];
+                down[i] = low[i-1] - low[i];
+                plus_dm[i] = (up[i] > down[i] && up[i] > 0) ? up[i] : 0;
+                minus_dm[i] = (down[i] > up[i] && down[i] > 0) ? down[i] : 0;
+            }
+
+            let tr = calcTrueRange(high, low, close);
+            let atr_s = wilderSmooth(tr, period);
+            let plus_s = wilderSmooth(plus_dm, period);
+            let minus_s = wilderSmooth(minus_dm, period);
+
+            let dx = new Array(close.length).fill(0);
+            for(let i=period; i<close.length; i++) {
+                let plus_di = 100.0 * plus_s[i] / atr_s[i];
+                let minus_di = 100.0 * minus_s[i] / atr_s[i];
+                if (plus_di + minus_di === 0) dx[i] = 0;
+                else dx[i] = 100.0 * Math.abs(plus_di - minus_di) / (plus_di + minus_di);
+            }
+
+            let adx_s = wilderSmooth(dx, period);
+            return adx_s[adx_s.length - 1];
+        }
+
+        function efficiencyRatio(close, window) {
+            if (close.length < window + 1) return NaN;
+            let seg = close.slice(-(window + 1));
+            let net = Math.abs(seg[seg.length - 1] - seg[0]);
+            let path = 0;
+            for(let i=1; i<seg.length; i++) path += Math.abs(seg[i] - seg[i-1]);
+            return path > 0 ? net / path : 0.0;
+        }
+
+        function choppinessIndex(high, low, close, window) {
+            if (close.length < window + 1) return NaN;
+            let tr = calcTrueRange(high, low, close).slice(-window);
+            let sumTr = tr.reduce((a, b) => a + b, 0);
+            let hh = Math.max(...high.slice(-window));
+            let ll = Math.min(...low.slice(-window));
+            let rng = hh - ll;
+            if (rng <= 0 || sumTr <= 0) return NaN;
+            return 100.0 * Math.log10(sumTr / rng) / Math.log10(window);
+        }
+
+        function linregStats(close, window) {
+            if (close.length < window) return [NaN, NaN];
+            let y = close.slice(-window);
+            let sumX = 0, sumY = 0, sumXY = 0, sumXX = 0;
+            for(let i=0; i<window; i++) {
+                sumX += i;
+                sumY += y[i];
+                sumXY += i * y[i];
+                sumXX += i * i;
+            }
+            let slope = (window * sumXY - sumX * sumY) / (window * sumXX - sumX * sumX);
+            let meanY = sumY / window;
+            let slope_pct = (slope / meanY) * 100.0;
+
+            let intercept = meanY - slope * (sumX / window);
+            let ss_tot = 0, ss_res = 0;
+            for(let i=0; i<window; i++) {
+                ss_tot += Math.pow(y[i] - meanY, 2);
+                let fitted = slope * i + intercept;
+                ss_res += Math.pow(y[i] - fitted, 2);
+            }
+            let r2 = ss_tot > 0 ? 1.0 - (ss_res / ss_tot) : 0.0;
+            return [slope_pct, r2];
+        }
+
+        // --- SCORING & FILTRES ---
+        function clip01(x) { return Math.max(0, Math.min(1, x)); }
+        function linearScore(val, best, worst) {
+            if(isNaN(val)) return 0;
+            if(best < worst) return clip01((worst - val)/(worst - best));
+            return clip01((val - worst)/(best - worst));
+        }
+        function bandScore(val, low, high, hardLow, hardHigh) {
+            if(isNaN(val)) return 0;
+            if(val >= low && val <= high) return 1;
+            if(val < low) return (low > hardLow) ? clip01((val - hardLow)/(low - hardLow)) : 0;
+            return (hardHigh > high) ? clip01((hardHigh - val)/(hardHigh - high)) : 0;
+        }
+
+        function computeScore(metrics) {
+            let c = {};
+            let [slope, r2] = [metrics.slope_pct, metrics.r2];
+
+            c.adx = linearScore(metrics.adx, 15, 30);
+            c.efficiency = linearScore(metrics.er, 0.05, 0.40);
+            c.choppiness = linearScore(metrics.chop, 61.8, 38.2);
+            c.regression = 0.5 * linearScore(Math.abs(slope), 0.01, 0.12) + 0.5 * linearScore(r2, 0.10, 0.75);
+            c.volatility = bandScore(metrics.atr_pct, 0.4, 1.5, 0.15, 3.5);
+            c.funding = linearScore(Math.abs(metrics.funding), 0.0001, 0.0010);
+
+            let minVol = document.getElementById('minVol').value * 1e6;
+            let ratio = (metrics.volume > 0 && minVol > 0) ? metrics.volume / minVol : 0;
+            c.volume = clip01(Math.log10(Math.max(ratio, 1.0)) / Math.log10(50.0));
+
+            let totalW = Object.values(CFG.weights).reduce((a,b)=>a+b, 0);
+            let score = 0;
+            for (let key in CFG.weights) score += (CFG.weights[key] * (c[key] || 0));
+            return (100.0 * score / totalW);
+        }
+
+        function quantile(arr, q) {
+            let sorted = arr.slice().sort((a,b)=>a-b);
+            let pos = (sorted.length - 1) * q;
+            let base = Math.floor(pos);
+            let rest = pos - base;
+            if (sorted[base + 1] !== undefined) {
+                return sorted[base] + rest * (sorted[base + 1] - sorted[base]);
+            } else {
+                return sorted[base];
+            }
+        }
+
+        function recommendGrid(metrics) {
+            let atrAbs = (metrics.atr_pct / 100.0) * metrics.price;
+            let low = quantile(metrics.recent_lows, 0.10) - 0.5 * atrAbs;
+            let high = quantile(metrics.recent_highs, 0.90) + 0.5 * atrAbs;
+
+            let center = (low + high) / 2;
+            let minWidth = CFG.grid_min_width_atr * atrAbs;
+            if (high - low < minWidth) {
+                low = center - minWidth / 2;
+                high = center + minWidth / 2;
+            }
+
+            let widthPct = (high - low) / metrics.price * 100;
+            let feeRtPct = 2.0 * CFG.maker_fee_pct;
+            let minStepPct = CFG.grid_min_step_fee_mult * feeRtPct;
+
+            let nMax = Math.floor(widthPct / minStepPct) + 1;
+            let n = Math.floor(widthPct / (CFG.grid_step_atr * metrics.atr_pct)) + 1;
+
+            n = Math.min(n, nMax);
+            n = Math.max(CFG.grid_min_levels, Math.min(CFG.grid_max_levels, n));
+
+            return { grid_low: low, grid_high: high, grid_levels: n };
+        }
+
+        // --- FETCH ROBUSTE AVEC ROTATION DE PROXYS ---
+        async function fetchAPI(path) {
+            let lastError;
+
+            // Tente de récupérer les données en essayant les proxys l'un après l'autre
+            for (let proxy of PROXIES) {
+                try {
+                    let url = proxy + encodeURIComponent(BASE_URL + path);
+                    let res = await fetch(url);
+
+                    if (!res.ok) throw new Error(`HTTP Error: ${res.status}`);
+                    let data = await res.json();
+
+                    // Si Binance renvoie un objet d'erreur (ex: Rate limit)
+                    if (data && data.code !== undefined && data.msg) {
+                        throw new Error(`Binance API: ${data.msg}`);
+                    }
+
+                    return data; // Succès, on retourne les données
+                } catch (e) {
+                    lastError = e;
+                    console.warn(`Le proxy ${proxy} a échoué: ${e.message}. Essai du proxy suivant...`);
+                }
+            }
+
+            // Si tous les proxys ont échoué
+            throw new Error(`Tous les proxys ont échoué. Dernière erreur: ${lastError.message}`);
+        }
+
+        async function startScan() {
+            const btn = document.getElementById('scanBtn');
+            const status = document.getElementById('status');
+            const tbody = document.querySelector('#results tbody');
+
+            btn.disabled = true;
+            tbody.innerHTML = "";
+            let minVol = document.getElementById('minVol').value * 1e6;
+
+            try {
+                status.innerText = "1/3 : Récupération des tickers 24h et du Funding Rate...";
+
+                let tickers = await fetchAPI('/fapi/v1/ticker/24hr');
+
+                // Le funding rate est une info secondaire : si son fetch échoue
+                // (proxys indisponibles, rate-limit...), on continue le scan
+                // sans bloquer tout le monde sur cette seule requête.
+                let fundingMap = {};
+                try {
+                    let premium = await fetchAPI('/fapi/v1/premiumIndex');
+                    if (Array.isArray(premium)) {
+                        premium.forEach(p => {
+                            if(p.symbol) fundingMap[p.symbol] = parseFloat(p.lastFundingRate);
+                        });
+                    }
+                } catch (e) {
+                    console.warn(`Funding rate indisponible, poursuite sans ces données: ${e.message}`);
+                }
+
+                if (!Array.isArray(tickers)) {
+                    throw new Error("Impossible de lire les tickers 24h depuis Binance.");
+                }
+
+                // Filtrage de TOUTES les paires qui dépassent le volume (Aucune limite)
+                let pairs = tickers
+                    .filter(t => t.symbol && t.symbol.endsWith('USDT') && parseFloat(t.quoteVolume) >= minVol)
+                    .sort((a,b) => parseFloat(b.quoteVolume) - parseFloat(a.quoteVolume));
+
+                if (pairs.length === 0) {
+                    throw new Error(`Aucune paire trouvée avec un volume > ${minVol / 1e6} M$.`);
+                }
+
+                let results = [];
+                // Analyse séquentielle de TOUTES les paires filtrées
+                for(let i=0; i<pairs.length; i++) {
+                    status.innerText = `2/3 : Analyse de ${pairs[i].symbol} (${i+1}/${pairs.length}). Veuillez patienter...`;
+
+                    try {
+                        let klines = await fetchAPI(`/fapi/v1/klines?symbol=${pairs[i].symbol}&interval=1h&limit=${CFG.analysis_hours + CFG.indicator_period + 5}`);
+
+                        if (!Array.isArray(klines) || klines.length < CFG.min_klines) continue;
+
+                        let high = klines.map(k => parseFloat(k[2]));
+                        let low = klines.map(k => parseFloat(k[3]));
+                        let close = klines.map(k => parseFloat(k[4]));
+
+                        let price = parseFloat(pairs[i].lastPrice);
+                        let [slope, r2] = linregStats(close, CFG.analysis_hours);
+
+                        let metrics = {
+                            symbol: pairs[i].symbol,
+                            price: price,
+                            volume: parseFloat(pairs[i].quoteVolume),
+                            funding: fundingMap[pairs[i].symbol] || 0,
+                            adx: adx(high, low, close, CFG.indicator_period),
+                            atr_pct: atrPct(high, low, close, CFG.indicator_period),
+                            er: efficiencyRatio(close, CFG.analysis_hours),
+                            chop: choppinessIndex(high, low, close, CFG.analysis_hours),
+                            slope_pct: slope,
+                            r2: r2,
+                            recent_highs: high.slice(-CFG.analysis_hours),
+                            recent_lows: low.slice(-CFG.analysis_hours)
+                        };
+
+                        metrics.score = computeScore(metrics);
+                        Object.assign(metrics, recommendGrid(metrics));
+                        results.push(metrics);
+
+                        // Affichage en temps réel pour rassurer l'utilisateur
+                        renderTableProgress(results);
+
+                        // Pause de 400ms pour éviter de se faire bloquer (Rate Limit) par le proxy ou Binance
+                        await new Promise(r => setTimeout(r, 400));
+
+                    } catch(e) {
+                        console.warn(`Erreur lors de l'analyse de ${pairs[i].symbol} : ${e.message}`);
+                    }
+                }
+
+                status.innerText = `3/3 : Scan terminé. ${results.length} paires analysées avec succès au-dessus de ${minVol / 1e6} M$.`;
+
+            } catch (err) {
+                status.innerText = `Erreur critique: ${err.message}`;
+                console.error(err);
+            } finally {
+                btn.disabled = false;
+            }
+        }
+
+        function fmt(val, dec) { return isNaN(val) ? "—" : val.toFixed(dec); }
+
+        // Affiche les résultats et les trie au fur et à mesure
+        function renderTableProgress(results) {
+            results.sort((a,b) => b.score - a.score); // Toujours trier par score
+
+            const tbody = document.querySelector('#results tbody');
+            tbody.innerHTML = ""; // Vider le tableau
+
+            results.forEach(r => {
+                let tr = document.createElement('tr');
+                let scoreClass = r.score >= 70 ? 'green' : (r.score >= 50 ? 'yellow' : 'red');
+                let adxClass = r.adx < 20 ? 'green' : '';
+                let erClass = r.er < 0.15 ? 'green' : '';
+                let chopClass = r.chop > 61.8 ? 'green' : '';
+                let atrClass = (r.atr_pct >= 0.4 && r.atr_pct <= 1.5) ? 'green' : '';
+
+                tr.innerHTML = `
+                    <td>${r.symbol}</td>
+                    <td class="${scoreClass}">${fmt(r.score, 1)}</td>
+                    <td>${fmt(r.price, 4)}</td>
+                    <td class="${adxClass}">${fmt(r.adx, 1)}</td>
+                    <td class="${erClass}">${fmt(r.er, 3)}</td>
+                    <td class="${chopClass}">${fmt(r.chop, 1)}</td>
+                    <td class="${atrClass}">${fmt(r.atr_pct, 2)}</td>
+                    <td class="green">${fmt(r.volume / 1e6, 0)}</td>
+                    <td>${fmt(r.grid_low, 4)}</td>
+                    <td>${fmt(r.grid_high, 4)}</td>
+                    <td>${r.grid_levels}</td>
+                `;
+                tbody.appendChild(tr);
+            });
+        }
+    </script>
+</body>
+</html>
